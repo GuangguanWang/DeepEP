@@ -11,6 +11,8 @@
 #include "exception.cuh"
 #include "utils.cuh"
 
+#define ENABLE_RWWI 1
+
 namespace deep_ep {
 
 EP_STATIC_ASSERT(NVSHMEMI_IBGDA_MIN_QP_DEPTH >= 64, "Invalid QP minimum depth");
@@ -265,22 +267,26 @@ ibgda_get_wqe_ptr(nvshmemi_ibgda_device_qp_t* qp, uint16_t wqe_idx) {
 }
 
 __device__ static __forceinline__ void
-nvshmemi_ibgda_rma_p(int *rptr, const int value, int dst_pe, int qp_id, uint32_t imm = std::numeric_limits<uint32_t>::max()) {
-    // Get rkey
-    // NOTES: the `p` operation will not cross multiple remote chunks
-    __be32 rkey;
-    uint64_t raddr;
-    auto qp = ibgda_get_rc(dst_pe, qp_id);
-    ibgda_get_rkey(reinterpret_cast<uint64_t>(rptr), dst_pe, &raddr, &rkey, qp->dev_idx);
-    
-    // Write WQEs
-    uint64_t base_wqe_idx = ibgda_reserve_wqe_slots(qp, 1);
-    void *wqe_ptrs;
-    wqe_ptrs = ibgda_get_wqe_ptr(qp, base_wqe_idx);
-    ibgda_write_rdma_write_inl_wqe(qp, reinterpret_cast<const uint32_t*>(&value), raddr, rkey, base_wqe_idx, &wqe_ptrs, imm);
+nvshmemi_ibgda_rma_p(int *rptr, const int value, int dst_pe, int qp_id, uint32_t imm = std::numeric_limits<uint32_t>::max(), bool is_local_copy = false) {
+    if (is_local_copy) {
+        st_na_global(rptr, value);
+    } else {
+        // Get rkey
+        // NOTES: the `p` operation will not cross multiple remote chunks
+        __be32 rkey;
+        uint64_t raddr;
+        auto qp = ibgda_get_rc(dst_pe, qp_id);
+        ibgda_get_rkey(reinterpret_cast<uint64_t>(rptr), dst_pe, &raddr, &rkey, qp->dev_idx);
 
-    // Submit requests
-    ibgda_submit_requests<true>(qp, base_wqe_idx, 1);
+        // Write WQEs
+        uint64_t base_wqe_idx = ibgda_reserve_wqe_slots(qp, 1);
+        void *wqe_ptrs;
+        wqe_ptrs = ibgda_get_wqe_ptr(qp, base_wqe_idx);
+        ibgda_write_rdma_write_inl_wqe(qp, reinterpret_cast<const uint32_t*>(&value), raddr, rkey, base_wqe_idx, &wqe_ptrs, imm);
+
+        // Submit requests
+        ibgda_submit_requests<true>(qp, base_wqe_idx, 1);
+    }
 }
 
 __device__ static __forceinline__ void
@@ -320,6 +326,7 @@ ibgda_write_rdma_write_wqe(nvshmemi_ibgda_device_qp_t *qp, uint64_t laddr, __be3
     st_na_relaxed(reinterpret_cast<int4*>(data_seg_ptr), *reinterpret_cast<const int4*>(&data_seg));
 }
 
+#ifdef ENABLE_RWWI
 __device__ static __forceinline__ void
 ibgda_write_empty_recv_wqe(void *out_wqe) {
     auto *data_seg_ptr = reinterpret_cast<struct mlx5_wqe_data_seg*>(out_wqe);
@@ -333,6 +340,81 @@ ibgda_write_empty_recv_wqe(void *out_wqe) {
     EP_STATIC_ASSERT(sizeof(mlx5_wqe_data_seg) == sizeof(int4), "Invalid data type length");
     st_na_relaxed(reinterpret_cast<int4*>(data_seg_ptr), *reinterpret_cast<const int4*>(&data_seg));
 }
+
+// Wait until wqe `idx - 1` is completed.
+// This is a simplified version of NVSHMEM's `ibgda_poll_cq`. It can only be used for polling recv.
+// Because we post recv and poll recv in the same thread, so we don't need to maintain queue status.
+__device__ static __forceinline__ void
+nvshmemi_ibgda_poll_recv(int dst_pe, int qp_id) {
+    auto qp = ibgda_get_rc(dst_pe, qp_id);
+    auto cq = qp->rx_wq.cq;
+
+    const uint32_t ncqes = cq->ncqes;
+    auto *cqe64 = reinterpret_cast<struct mlx5_cqe64*>(cq->cqe);
+    auto old_cons_idx = *cq->cons_idx;
+    *cq->cons_idx = old_cons_idx + 1;
+
+    // Wait until `wqe_counter >= old_cons_idx`
+    while ((static_cast<uint16_t>(old_cons_idx - HtoBE16(ld_na_relaxed(&cqe64->wqe_counter)) - 1) < ncqes));
+}
+
+__device__ static __forceinline__ void
+nvshmemi_ibgda_update_rx_state(int dst_pe, int qp_id) {
+    auto qp = ibgda_get_rc(dst_pe, qp_id);
+    auto cq = qp->rx_wq.cq;
+    auto *cqe64 = reinterpret_cast<struct mlx5_cqe64*>(cq->cqe);
+    uint8_t opown;
+    uint8_t opcode;
+
+    opown = ld_na_relaxed(&cqe64->op_own);
+    opcode = opown >> 4;
+    if (opcode != MLX5_CQE_INVALID)
+        *cq->cons_idx = HtoBE16(ld_na_relaxed(&cqe64->wqe_counter)) + 1;
+}
+
+__device__ static __forceinline__ uint64_t
+nvshmemi_ibgda_allocate_recvs(nvshmemi_ibgda_device_qp* qp) {
+    auto state = ibgda_get_state();
+    auto mvars = &qp->mvars;
+
+    // Allocate if not enough
+    constexpr int kMinIBGDARecvs = 32;
+    auto resv_head_ptr = state->use_async_postsend? qp->rx_wq.prod_idx : &mvars->rx_wq.resv_head;
+    auto resv_head = ld_na_relaxed(resv_head_ptr);
+    auto num_valid_slots = resv_head - mvars->rx_wq.cons_idx;
+    if (num_valid_slots < kMinIBGDARecvs) {
+        resv_head = mvars->rx_wq.cons_idx + qp->rx_wq.nwqes;
+        st_na_release(resv_head_ptr, resv_head);
+
+        if (!state->use_async_postsend) {
+            // Ensure WQE is written before `dbrec`
+            __be32 dbrec_val;
+            __be32 *dbrec_ptr = qp->rx_wq.dbrec;
+
+            // Compared to sending, for each QP, we only post recv in a single thread,
+            // so we don't need to do synchronization here
+            // This is equivalent to `WRITE_ONCE(dbrec_ptr, HtoBE32(wqe_idx & 0xffff))`
+            asm("{\n\t"
+                ".reg .b32 dbrec_head_16b;\n\t"
+                ".reg .b32 ign;\n\t"
+                "and.b32 dbrec_head_16b, %1, 0xffff;\n\t"
+                "prmt.b32 %0, dbrec_head_16b, ign, 0x123;\n\t"
+                "}" : "=r"(dbrec_val)
+                    : "r"(static_cast<uint32_t>(resv_head)));
+            st_na_release(dbrec_ptr, dbrec_val);
+        }
+    }
+
+    // Return old number of slots
+    return num_valid_slots;
+}
+
+__device__ static __forceinline__ void
+nvshmemi_ibgda_prepare_recvs(int dst_rank, int qp_id) {
+    // NOTES: only one thread can run this function
+    EP_DEVICE_ASSERT(nvshmemi_ibgda_allocate_recvs(ibgda_get_rc(dst_rank, qp_id)) > 16);
+}
+#endif
 
 template <bool kAlwaysDoPostSend = false>
 __device__ static __forceinline__ void

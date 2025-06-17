@@ -9,12 +9,23 @@ namespace internode_ll {
 
 template <int kNumThreads> __launch_bounds__(kNumThreads, 1)
 __global__ void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
-                                         int* clean_1, int num_clean_int_1) {
+                                         int* clean_1, int num_clean_int_1,
+                                         int rank, int num_ranks) {
     // Barrier before cleaning (in case of unfinished chunked EP)
     nvshmemx_barrier_all_block();
 
     // Clean
     auto thread_id = static_cast<int>(threadIdx.x);
+#ifdef ENABLE_RWWI
+    auto num_rc_per_pe = ibgda_get_state()->num_rc_per_pe * ibgda_get_state()->num_devices_initialized;
+    auto num_qps = num_rc_per_pe * (num_ranks - 1);
+    #pragma unroll
+    for (int qp_idx = thread_id; qp_idx < num_qps; qp_idx += kNumThreads) {
+        auto dst_rank = (qp_idx / num_rc_per_pe + rank + 1) % num_ranks;
+        auto qp_id = qp_idx % num_rc_per_pe;
+        nvshmemi_ibgda_update_rx_state(dst_rank, qp_id);
+    }
+#endif
     #pragma unroll
     for (int i = thread_id; i < num_clean_int_0; i += kNumThreads)
         clean_0[i] = 0;
@@ -28,12 +39,13 @@ __global__ void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
 
 void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
                               int* clean_1, int num_clean_int_1,
+                              int rank, int num_ranks,
                               cudaStream_t stream) {
     constexpr int kNumThreads = 256;
 
     SETUP_LAUNCH_CONFIG(1, kNumThreads, stream);
     LAUNCH_KERNEL(&cfg, clean_low_latency_buffer<kNumThreads>,
-                  clean_0, num_clean_int_0, clean_1, num_clean_int_1);
+                  clean_0, num_clean_int_0, clean_1, num_clean_int_1, rank, num_ranks);
 }
 
 template <bool kUseFP8, bool kUseUE8M0, int kHidden>
@@ -226,7 +238,13 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
         auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
         if (dst_p2p_ptr == 0) {
+#ifndef ENABLE_RWWI
             nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
+#else
+            nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(dst_ptr), -num_tokens_sent - 1,
+                dst_rank, dst_expert_local_idx, 0);
+            nvshmemi_ibgda_prepare_recvs(dst_rank, dst_expert_local_idx);
+#endif
         } else {
             st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), -num_tokens_sent - 1);
         }
@@ -272,7 +290,19 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         int num_recv_tokens, recv_token_begin_idx;
         EP_DEVICE_ASSERT(num_warps_per_group > 1 and num_warp_groups < 15);
         if (sub_warp_id == 1 and lane_id == 0) {
+#ifndef ENABLE_RWWI
             while ((num_recv_tokens = ld_acquire_sys_global(rdma_recv_count + local_expert_idx * num_ranks + src_rank)) == 0);
+#else
+            auto src_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + local_expert_idx * num_ranks + src_rank);
+            auto src_p2p_ptr = nvshmemi_get_p2p_ptr(src_ptr, rank, src_rank);
+            if (src_p2p_ptr == 0) {
+                nvshmemi_ibgda_poll_recv(src_rank, local_expert_idx);
+                num_recv_tokens = ld_acquire_sys_global(rdma_recv_count + local_expert_idx * num_ranks + src_rank);
+                EP_DEVICE_ASSERT(num_recv_tokens != 0);
+            } else {
+                while ((num_recv_tokens = ld_acquire_global(rdma_recv_count + local_expert_idx * num_ranks + src_rank)) == 0);
+            }
+#endif
             num_recv_tokens = -num_recv_tokens - 1;
             recv_token_begin_idx = atomicAdd(packed_recv_count + local_expert_idx, num_recv_tokens);
             shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
@@ -600,7 +630,11 @@ combine(void* combined_x,
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
             auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
             if (dst_p2p_ptr == 0) {
+#ifndef ENABLE_RWWI
                 nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx);
+#else
+                nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx, 0);
+#endif
             } else {
                 st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), 1);
             }
@@ -617,8 +651,22 @@ combine(void* combined_x,
     // Wait all ranks to arrive
     if (responsible_expert_idx < num_experts) {
         EP_DEVICE_ASSERT(num_warps_per_group > 1);
+#ifndef ENABLE_RWWI
         if (sub_warp_id == 0 and lane_id == 0) {
             while (ld_acquire_sys_global(rdma_recv_flag + responsible_expert_idx) == 0);
+#else
+        if (sub_warp_id == 0 and lane_id == 0) {
+            // TODO: refactor QP indices
+            auto src_rank = responsible_expert_idx / num_local_experts;
+            auto src_expert_idx = responsible_expert_idx % num_local_experts;
+            auto src_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + responsible_expert_idx);
+            auto src_p2p_ptr = nvshmemi_get_p2p_ptr(src_ptr, rank, src_rank);
+            if (src_p2p_ptr == 0) {
+                nvshmemi_ibgda_poll_recv(src_rank, src_expert_idx);
+            } else {
+                while (ld_acquire_sys_global(rdma_recv_flag + responsible_expert_idx) == 0);
+            }
+#endif
         }
     }
     cg::this_grid().sync();

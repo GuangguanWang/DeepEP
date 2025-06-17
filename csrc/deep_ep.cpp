@@ -1081,6 +1081,7 @@ void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int 
 
     internode_ll::clean_low_latency_buffer(clean_meta_0.first, clean_meta_0.second,
                                            clean_meta_1.first, clean_meta_1.second,
+                                           rank, num_ranks,
                                            at::cuda::getCurrentCUDAStream());
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
